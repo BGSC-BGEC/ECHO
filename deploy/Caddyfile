@@ -1,0 +1,5 @@
+# Automatic HTTPS (Let's Encrypt). WebSocket upgrade is proxied transparently.
+{$ECHO_DOMAIN} {
+	encode gzip
+	reverse_proxy server:8787
+}
