@@ -27,19 +27,24 @@ export function Results({ view }: { view: GameView }) {
   const youWon = won;
 
   // Per-runner survival line; top hunter by captures.
+  const infection = view.mode === 'infection'; // settings can't change between the round's end and this screen
+  const caughtWord = infection ? 'infected' : 'caught';
   const runners = r.runners.map(p => { // who ran this round, even if they've since left the results screen
-    const c = r.captures.find(x => x.runnerId === p.id);
+    const cs = r.captures.filter(x => x.runnerId === p.id), c = cs.at(-1); // infection: a runner can be caught, cured, caught again
+    const survived = r.survivors.includes(p.alias);
     const now = view.players.find(x => x.id === p.id);
-    return { alias: p.alias, time: c ? c.atChaseMs : r.chaseMs, caughtBy: c?.byAlias, left: !c && (!now || now.status === 'withdrawn') && !r.survivors.includes(p.alias) };
+    return { alias: p.alias, time: !survived && c ? c.atChaseMs : r.chaseMs, caughtBy: survived ? undefined : c?.byAlias, times: cs.length,
+      left: !survived && !c && (!now || now.status === 'withdrawn') };
   }).sort((a, b) => b.time - a.time);
   const tally = new Map<string, number>();
   r.captures.forEach(c => tally.set(c.byAlias, (tally.get(c.byAlias) ?? 0) + 1));
   const topHunter = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
-  const mvp = r.winner === 'hunters' && topHunter ? `${topHunter[0]} · ${topHunter[1]} catch${topHunter[1] > 1 ? 'es' : ''}`
-    : runners[0] && !runners[0].caughtBy ? `${runners[0].alias} · survived ${fmt(runners[0].time)}` : topHunter ? `${topHunter[0]} · ${topHunter[1]} catches` : null;
+  const noun = (n: number) => (infection ? (n === 1 ? 'infection' : 'infections') : n === 1 ? 'catch' : 'catches');
+  const mvp = r.winner === 'hunters' && topHunter ? `${topHunter[0]} · ${topHunter[1]} ${noun(topHunter[1])}`
+    : runners[0] && !runners[0].caughtBy ? `${runners[0].alias} · survived ${fmt(runners[0].time)}` : topHunter ? `${topHunter[0]} · ${topHunter[1]} ${noun(topHunter[1])}` : null;
 
   const share = () => Share.share({
-    message: `ECHO · ${title}\n${r.reason}\n` + runners.map(x => `${x.caughtBy ? '✕' : '✓'} ${x.alias} ${fmt(x.time)}${x.caughtBy ? ` (by ${x.caughtBy})` : ''}`).join('\n'),
+    message: `ECHO · ${title}\n${r.reason}\n` + runners.map(x => `${x.caughtBy ? '✕' : '✓'} ${x.alias} ${fmt(x.time)}${x.caughtBy ? ` (${caughtWord} by ${x.caughtBy})` : ''}`).join('\n'),
   }).catch(() => {});
 
   return (
@@ -56,7 +61,7 @@ export function Results({ view }: { view: GameView }) {
         </View>
 
         <Animated.View entering={FadeInDown.delay(150)} style={st.stats}>
-          <Stat label="Captures" value={String(r.captures.length)} />
+          <Stat label={infection ? 'Infections' : 'Captures'} value={String(r.captures.length)} />
           <Stat label="Survivors" value={String(r.survivors.length)} />
           <Stat label="Chase" value={fmt(r.chaseMs)} />
         </Animated.View>
@@ -77,7 +82,7 @@ export function Results({ view }: { view: GameView }) {
               <View key={x.alias} style={st.row}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: S.sm, flex: 1 }}>
                   <RoleGlyph role="runner" size={12} />
-                  <Text style={u.body} numberOfLines={1}>{x.alias} <Text style={u.muted}>{x.caughtBy ? `caught by ${x.caughtBy}` : x.left ? 'left' : 'survived'}</Text></Text>
+                  <Text style={u.body} numberOfLines={1}>{x.alias} <Text style={u.muted}>{x.caughtBy ? `${caughtWord} by ${x.caughtBy}${x.times > 1 ? ` · ${x.times}×` : ''}` : x.left ? 'left' : x.times ? `survived · infected ${x.times}×` : 'survived'}</Text></Text>
                 </View>
                 <Text style={[u.body, { fontVariant: ['tabular-nums'], color: x.caughtBy ? C.muted : C.ok }]}>{fmt(x.time)}</Text>
               </View>
@@ -102,9 +107,9 @@ export function Results({ view }: { view: GameView }) {
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setIntro(false)} accessibilityLabel="Skip" />
           <EchoRings size={300} color={color} />
           <View style={{ position: 'absolute', alignItems: 'center', gap: 6 }} pointerEvents="none">
-            <Text style={u.label}>{finalCatch ? 'Final catch' : 'Round over'}</Text>
+            <Text style={u.label}>{finalCatch ? (infection ? 'Final infection' : 'Final catch') : 'Round over'}</Text>
             <Text style={[st.introTitle, { color }]}>{finalCatch ? finalCatch.alias.toUpperCase() : title}</Text>
-            {finalCatch && <Text style={u.h2}>caught by {finalCatch.byAlias}</Text>}
+            {finalCatch && <Text style={u.h2}>{caughtWord} by {finalCatch.byAlias}</Text>}
           </View>
         </Animated.View>
       )}

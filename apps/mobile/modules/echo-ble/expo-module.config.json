@@ -1,0 +1,9 @@
+{
+  "platforms": ["android", "apple"],
+  "apple": {
+    "modules": ["EchoBleModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.echoble.EchoBleModule"]
+  }
+}

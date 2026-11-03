@@ -1,16 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, Vibration, View } from 'react-native';
+import { Alert, Linking, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, Vibration, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { MaterialCommunityIcons as Icon } from '@expo/vector-icons';
 import Animated, { FadeIn, FadeOut, ZoomIn, useAnimatedStyle, useSharedValue, withSequence, withTiming } from 'react-native-reanimated';
-import { RULES, SHRINK, clearlyOutside, distanceM, type GameEvent, type LngLat, type View as GameView } from '@echo/shared';
+import { INFECTION, POWERS, RULES, SHRINK, clearlyOutside, distanceM, placeName, type GameEvent, type LngLat, type View as GameView } from '@echo/shared';
 import { leaveMatch, onGameEvent, send, serverNow, useNet } from '../net';
 import { fixAge, fixGood, useLocation } from '../location';
 import { GameMap, type CameraMode } from '../components/GameMap';
 import { ServerMoved } from '../components/ServerMoved';
+import { useWorldPack } from '../world';
+import { FreezeOfferOverlay, FreezeSheet, FrozenBanner, HoldToCollect, cooldownLabel } from '../components/Powers';
 import { Button, EchoRings, Pill, RoleGlyph, styles as u } from '../components/ui';
 import { C, S, ago, bearingLabel, fmt, roleColor } from '../theme';
+import { slashNow, useBle } from '../slash';
 
 function useNow(ms = 250) {
   const [now, setNow] = useState(serverNow());
@@ -25,12 +28,19 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
   const realNow = useNow();
   const paused = view.paused;
   // Clocks are frozen while paused (server shifts deadlines on resume), so render against the pause instant.
-  const now = paused && (!paused.resumeAt || realNow < paused.resumeAt) ? paused.since : realNow;
+  const now = paused ? paused.since : realNow; // frozen until the server actually shifts deadlines on resume
   const net = useNet();
   const { fix, prev, permission } = useLocation();
+  const world = useWorldPack(view.world);
+  // place names from public map data, at the same coarseness as the disclosed cell
+  const near = (cell?: LngLat[]) => { if (!world || !cell) return undefined; const n = placeName([(cell[0][0] + cell[2][0]) / 2, (cell[0][1] + cell[2][1]) / 2], world); return n ? `near ${n}` : undefined; };
   const [flash, setFlash] = useState<Flash | null>(null);
   const [toastMsg, setToast] = useState<string | null>(null);
   const [captureOpen, setCaptureOpen] = useState(false);
+  const [freezeOpen, setFreezeOpen] = useState(false);
+  const [trayH, setTrayH] = useState(0);
+  const [hudH, setHudH] = useState(0);
+  const [sweepRing, setSweepRing] = useState<{ center: LngLat; radiusM: number; key: number } | null>(null);
   const [rosterOpen, setRosterOpen] = useState(false);
   const [showCode, setShowCode] = useState(false);
   const [cam, setCam] = useState<CameraMode>('follow');
@@ -46,6 +56,19 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
   const rc = roleColor(role);
   const runners = view.players.filter(p => p.role === 'runner');
   const runnersLeft = runners.filter(p => p.status === 'active').length;
+  const infection = view.mode === 'infection';
+  const infectedN = view.players.filter(p => p.infected && p.status === 'active').length;
+  const infectedLeft = view.you.infectedUntil ? view.you.infectedUntil - now : 0;
+  const shieldLeft = view.you.shieldUntil ? view.you.shieldUntil - now : 0;
+  const slashMode = view.catchMethod === 'slash';
+  const [ble] = useBle();
+  const [scanning, setScanning] = useState(false);
+  const slashCooling = (view.slashReadyAt ?? 0) > now;
+  const doSlash = () => {
+    setScanning(true); Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    slashNow().catch(e => setToast(`Bluetooth: ${e?.message ?? 'scan failed'} — use the catch code`))
+      .finally(() => setTimeout(() => setScanning(false), 1200)); // hold until the server's cooldown reaches us
+  };
   // Outside only when the last two fixes agree, so boundary jitter doesn't flicker the warning.
   const isOut = (f?: typeof fix) => !!f && !!view.zone && clearlyOutside(f.p, f.acc, view.zone, view.zoneNow); // GPS error in the player's favour
   const outside = !caught && isOut(fix) && isOut(prev);
@@ -54,8 +77,13 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
   const pulseSoon = !hunter && !caught && pulseIn !== undefined && pulseIn < 10_000;
 
   const show = (f: Omit<Flash, 'key'>) => setFlash({ ...f, key: Date.now() });
+  // station holds need fixes now, not in 4 s
+  const pushFix = () => { if (fix) send({ t: 'loc', lng: fix.p[0], lat: fix.p[1], acc: fix.acc, ageMs: Date.now() - fix.ts, ts: fix.ts }, true); };
   // Role reveal for the first seconds of the round.
   const [intro, setIntro] = useState(view.phase === 'headstart');
+  const fixRef = useRef(fix);
+  useEffect(() => { fixRef.current = fix; }, [fix]);
+  useEffect(() => { if (!sweepRing) return; const id = setTimeout(() => setSweepRing(null), POWERS.sweep.brightMs); return () => clearTimeout(id); }, [sweepRing]);
   const caughtRef = useRef(caught);
   const stageRef = useRef(view.shrinkAt?.length ?? 0);
   const stagesLeft = view.shrinkAt?.length ?? 0;
@@ -80,19 +108,40 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
     if (e.kind === 'revealed') { Vibration.vibrate([0, 400, 120, 400]); show({ title: 'REVEALED', sub: 'Hunters saw your area — move!', color: C.warn }); }
     if (e.kind === 'unavailable') { Vibration.vibrate(300); setToast('Your GPS was too weak at that pulse — hunters saw “signal unavailable”'); }
     if (e.kind === 'phase' && e.phase === 'chase') { Vibration.vibrate([0, 600]); show({ title: 'HUNT ON', sub: hunter ? 'Go find them' : 'Hunters released', color: C.hunter }); }
-    if (e.kind === 'paused') { Vibration.vibrate([0, 700, 200, 700]); setCaptureOpen(false); setIntro(false); } // a pause closes sheets/intro; nothing reopens on resume
+    if (e.kind === 'paused') { Vibration.vibrate([0, 700, 200, 700]); setCaptureOpen(false); setFreezeOpen(false); setRosterOpen(false); setIntro(false); } // a pause closes sheets/intro; nothing reopens on resume
     if (caughtRef.current && (e.kind === 'zoneWarning' || e.kind === 'zoneShrunk')) return; // out of the round: no zone nagging
     if (e.kind === 'exposed') { if (exposedStage.current === stageRef.current) return; exposedStage.current = stageRef.current; } // flash once per stage; banner covers the rest
     if (e.kind === 'zoneWarning') { Vibration.vibrate([0, 300, 120, 300, 120, 300]); show({ title: 'ZONE SHRINKING', sub: `New zone in ${Math.max(1, Math.round((e.at - serverNow()) / 1000))} s — dashed ring`, color: C.amber, ms: 2600 }); }
     if (e.kind === 'zoneShrunk') { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); show({ title: 'ZONE SHRUNK', sub: hunter ? 'Runners outside it get exposed' : `Get inside in ${SHRINK.graceMs / 1000} s or you’re exposed`, color: C.amber, ms: 2400 }); }
     if (e.kind === 'exposed') { Vibration.vibrate([0, 500, 150, 500]); show({ title: 'EXPOSED', sub: 'You’re outside the zone — hunters can see you', color: C.warn }); }
     if (e.kind === 'resumed') { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); show({ title: 'GO', sub: 'Round resumed', color: C.ok }); }
+    if (e.kind === 'freezeOffer') { Vibration.vibrate([0, 600, 150, 600, 150, 600]); setCaptureOpen(false); setRosterOpen(false); } // sheets are separate windows: they'd hide the offer
+    if (e.kind === 'frozen') setCaptureOpen(false);
+    if (e.kind === 'frozen') show({ title: 'FROZEN', sub: `${POWERS.freeze.activeMs / 1000} s — stay where you are`, color: C.cyan });
+    if (e.kind === 'freezeEnded') { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); setToast('Freeze over — you’re immune for 45 s. GO.'); }
+    if (e.kind === 'freezeResult') {
+      if (e.ok) { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); show({ title: 'FROZE', sub: `${e.targetAlias} is frozen — your area was revealed. Move!`, color: C.cyan, ms: 2400 }); }
+      else setToast(e.reason ?? 'Freeze returned');
+    }
+    if (e.kind === 'casterRevealed') { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); setToast(`${e.alias} used a Freeze — their area is on your map`); }
+    if (e.kind === 'sweepResult' && fixRef.current) setSweepRing({ center: fixRef.current.p, radiusM: POWERS.sweep.radiusM, key: Date.now() });
+    if (e.kind === 'sweepResult') {
+      Haptics.notificationAsync(e.confirmed ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Warning);
+      show({ title: 'SWEEP', sub: e.confirmed ? `${e.confirmed} runner${e.confirmed > 1 ? 's' : ''} within ${POWERS.sweep.radiusM} m${e.route ? ' by path' : ''}` : `No confirmed signals in range${e.uncertain ? ` · ${e.uncertain} near the edge` : ''}${e.unavailable ? ` · ${e.unavailable} unavailable` : ''}`, color: C.hunter, ms: 2600 });
+    }
+    if (e.kind === 'scanned') { Vibration.vibrate([0, 300, 100, 300]); show({ title: 'SCANNED', sub: 'A hunter’s Sweep found you — move', color: C.warn }); }
+    if (e.kind === 'claimed') { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); show({ title: e.item === 'freeze' ? '+ FREEZE' : '+ SWEEP', sub: 'Collected', color: C.amber }); }
+    if (e.kind === 'claimFailed') setToast(e.reason);
     if (e.kind === 'captured') {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-      if (e.runnerId === view.you.id) show({ title: 'CAUGHT', sub: `by ${e.byAlias}`, color: C.warn, ms: 2600 });
-      else if (e.byAlias === view.you.alias) show({ title: 'CAPTURED', sub: e.alias, color: C.hunter, ms: 2600 });
-      else setToast(`${e.alias} was caught by ${e.byAlias}`);
+      if (e.runnerId === view.you.id) { if (!e.infected) show({ title: 'CAUGHT', sub: `by ${e.byAlias}`, color: C.warn, ms: 2600 }); } // infected: its own flash below
+      else if (e.byAlias === view.you.alias) show({ title: e.infected ? 'INFECTED' : 'CAPTURED', sub: e.alias, color: C.hunter, ms: 2600 });
+      else setToast(e.infected ? `${e.alias} was infected by ${e.byAlias}` : `${e.alias} was caught by ${e.byAlias}`);
     }
+    if (e.kind === 'infected' || e.kind === 'cured') { setCaptureOpen(false); setFreezeOpen(false); setShowCode(false); setSweepRing(null); } // role flipped: nothing from the old role stays open
+    if (e.kind === 'infected') { Vibration.vibrate([0, 600, 150, 600]); show({ title: 'INFECTED', sub: `You hunt for ${fmt(e.until - serverNow())} — then you’re cured`, color: C.hunter, ms: 3200 }); }
+    if (e.kind === 'cured') { Vibration.vibrate([0, 300, 100, 300, 100, 300]); show({ title: 'CURED', sub: `You’re a runner again — safe for ${INFECTION.cureShieldMs / 1000} s. RUN.`, color: C.runner, ms: 3200 }); }
+    if (e.kind === 'slashMiss') { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error); setToast(`Missed — ${e.reason}`); }
   }), [hunter, view.you.id, view.you.alias]);
 
   // Hunter: when a new pulse lands, frame the revealed cells.
@@ -132,6 +181,7 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
   } else {
     big = fmt(view.chaseEndsAt! - now);
     if (caught) line = 'You are out · location sharing stopped';
+    else if (infectedLeft > 0) line = `Infected · cured in ${fmt(infectedLeft)}`;
     else if (pulseIn !== undefined) line = hunter ? `Next pulse in ${fmt(pulseIn)}` : `You reveal in ${fmt(pulseIn)}`;
     else line = 'No more pulses — final stretch';
   }
@@ -146,8 +196,9 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
     if (d.unavailable) return { id: r.id, alias: r.alias, text: 'signal unavailable', tone: C.warn, cell: undefined };
     const c = d.cell!; const mid: LngLat = [(c[0][0] + c[2][0]) / 2, (c[0][1] + c[2][1]) / 2];
     const where = fix ? `${Math.round(distanceM(fix.p, mid) / 10) * 10} m ${bearingLabel(fix.p, mid)}` : '';
-    return { id: r.id, alias: r.alias, text: `${d.exposed ? 'OUTSIDE ZONE · ' : ''}${where} · ${ago(now - (d.sampledAt ?? d.revealedAt))}`, tone: d.exposed ? C.warn : d.brightUntil > now ? C.amber : C.cyan, cell: c };
-  }), [view.disclosures, view.players, nowSec, fixTs]);
+    const place = near(c);
+    return { id: r.id, alias: r.alias, text: `${d.exposed ? 'OUTSIDE ZONE · ' : ''}${place ? `${place} · ` : ''}${where} · ${ago(now - (d.sampledAt ?? d.revealedAt))}`, tone: d.exposed ? C.warn : d.brightUntil > now ? C.amber : C.cyan, cell: c };
+  }), [view.disclosures, view.players, nowSec, fixTs, world]);
 
   const confirmLeave = () => Alert.alert(caught ? 'Leave the match?' : 'Leave and stop sharing?',
     caught ? 'You can still see the result if you stay.' : 'Your team plays on without you; the round becomes a practice result.', [
@@ -171,24 +222,38 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
     : view.zoneNow && !hunter ? `⚠ Outside the zone — hunters see you every ${SHRINK.exposeEveryMs / 1000} s`
     : '⚠ Outside the zone — head back in' });
   if (view.zoneNext && !caught) banners.push({ color: C.amber, text: hunter ? `Zone shrinks in ${fmt(view.zoneNext.at - now)}` : `Zone shrinks in ${fmt(view.zoneNext.at - now)} — get inside the dashed ring` });
+  if (shieldLeft > 0 && !caught) banners.push({ color: C.ok, text: `Just cured — nobody can catch you for ${Math.ceil(shieldLeft / 1000)} s` });
+  if (slashMode && !caught && Platform.OS === 'android' && (ble === 'off' || ble === 'unauthorized' || ble === 'location')) banners.push({ color: C.amber, text: `${ble === 'off' ? 'Bluetooth is off' : ble === 'location' ? 'Precise location is off' : 'Bluetooth not allowed'} — ${hunter ? 'you can only catch by code' : 'hunters can only catch you by code'}` });
   if (gpsBad) banners.push({ color: C.amber, text: !fix ? 'Waiting for GPS…' : fix.acc > RULES.maxAccuracyM ? `Weak GPS (±${Math.round(fix.acc)} m) — get under open sky` : `GPS stale (${Math.round(fixAge(fix) / 1000)}s) — step into open sky` });
   const offlineLong = !paused && !!net.downSince && realNow - net.downSince > 10_000; // TDD §06.6 local stop-play
-  const bottomH = caught ? 120 : hunter ? 210 : 170; // tray height, for map padding
+  // powers state for the tray
+  const powers = view.powers && view.phase === 'chase' && !caught;
+  const frozen = !!view.frozenUntil && view.frozenUntil > now;
+  const freezeItem = view.items?.find(i => i.type === 'freeze');
+  const sweepItem = view.items?.find(i => i.type === 'sweep');
+  const myType = hunter ? 'sweep' : 'freeze';
+  const canCollect = powers && !frozen && !!fix && !view.items?.some(i => i.type === myType);
+  const stationInRange = canCollect ? view.stations?.find(x => x.available && distanceM(fix!.p, x.p) <= POWERS.station.patchM) : undefined;
+  const stationGpsOk = !!fix && fixGood(fix) && fix.acc <= POWERS.station.maxAccM; // what the server will count
+  const nearStation = stationInRange && stationGpsOk ? stationInRange : undefined;
+  const sweepCooling = (view.sweepReadyAt ?? 0) > now; // lapses client-side; the server doesn't rebroadcast for it
+  const bottomH = trayH || (caught ? 120 : hunter ? 210 : 170) + (powers ? 64 : 0) + (nearStation ? 64 : 0); // measured tray height (fallback estimate)
 
   return (
     <View style={{ flex: 1, backgroundColor: C.bg }}>
       <GameMap zone={view.zone} disclosures={view.disclosures} now={mapNow} fix={caught ? undefined : fix} zoom={17}
         mode={cam} fitKey={fit.key} fitExtra={fit.pts}
-        padding={{ top: insets.top + 240, bottom: bottomH + 30, left: 40, right: 40 }}
+        padding={{ top: (hudH || insets.top + 240) + 10, bottom: bottomH + 30, left: 40, right: 40 }}
         ownReveal={view.yourReveal} zoneNow={view.zoneNow} zoneNext={view.zoneNext}
+        stations={view.stations} sweepRing={sweepRing ?? undefined} world={world}
         onUserPan={() => setCamManual('free')} />
 
       {/* top HUD */}
-      <View style={[st.top, { paddingTop: insets.top + S.sm }]} pointerEvents="box-none">
+      <View style={[st.top, { paddingTop: insets.top + S.sm }]} pointerEvents="box-none" onLayout={e => setHudH(e.nativeEvent.layout.height)}>
         <View style={st.topRow}>
           <View style={[st.roleBadge, { borderColor: rc }]}>
             <RoleGlyph role={role} size={12} />
-            <Text style={[st.roleText, { color: rc }]}>{caught ? (view.you.status === 'caught' ? 'CAUGHT' : 'LEFT') : role.toUpperCase()}</Text>
+            <Text style={[st.roleText, { color: rc }]}>{caught ? (view.you.status === 'caught' ? 'CAUGHT' : 'LEFT') : infectedLeft > 0 ? 'INFECTED' : role.toUpperCase()}</Text>
           </View>
           <View style={{ flexDirection: 'row', gap: S.sm }}>
             <Pressable hitSlop={8} onPress={onToggleAwake} accessibilityLabel={keepAwake ? 'Let screen sleep' : 'Keep screen on'} style={[st.iconBtn, keepAwake && { borderColor: C.amber }]}>
@@ -209,9 +274,10 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
           <Text style={st.timer} maxFontSizeMultiplier={1.2}>{big}</Text>
           <Text style={[st.line, pulseSoon ? { color: C.warn } : null]} maxFontSizeMultiplier={1.3}>{line}</Text>
           <Pressable hitSlop={8} onPress={() => setRosterOpen(true)} accessibilityLabel="Show players" style={{ marginTop: 6 }}>
-            <Pill icon="account-group" label={`${runnersLeft}/${runners.length} RUNNERS LEFT`} color={C.cyan} />
+            <Pill icon="account-group" label={infection ? `${runnersLeft} CLEAN · ${infectedN} INFECTED` : `${runnersLeft}/${runners.length} RUNNERS LEFT`} color={C.cyan} />
           </Pressable>
         </View>
+        {frozen && <FrozenBanner until={view.frozenUntil!} now={now} />}
         {banners.slice(0, 2).map(bn => <Banner key={bn.text} color={bn.color} text={bn.text} onPress={bn.onPress} />)}
       </View>
 
@@ -222,7 +288,7 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
       </View>
 
       {/* bottom tray */}
-      <View style={[st.bottom, { paddingBottom: insets.bottom + S.md }]}>
+      <View style={[st.bottom, { paddingBottom: insets.bottom + S.md }]} onLayout={e => setTrayH(e.nativeEvent.layout.height)}>
         {caught ? (
           <View style={{ alignItems: 'center', gap: 4 }}>
             <Text style={u.h2}>{view.you.status === 'caught' ? 'You were caught' : 'You left the round'}</Text>
@@ -238,15 +304,43 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
                 </Pressable>
               ))}
             </ScrollView>
-            <Button big icon="handcuffs" title={view.phase === 'chase' ? 'CAPTURE' : 'CAPTURE · AFTER HEAD START'} color={C.hunter}
-              disabled={view.phase !== 'chase'} onPress={() => setCaptureOpen(true)} />
+            {nearStation && <HoldToCollect stationId={nearStation.id} label="a Sweep" onStart={pushFix} fixes={view.claim?.fixes} />}
+            {stationInRange && !stationGpsOk && <Text style={[u.muted, { textAlign: 'center', color: C.amber }]}>Station here — GPS too weak to collect (needs ±{POWERS.station.maxAccM} m). Step into open sky.</Text>}
+            <View style={{ flexDirection: 'row', gap: S.sm }}>
+              {view.powers && (
+                <Button big icon="radar" style={{ flex: 1 }} color={C.amber} variant={sweepItem && !sweepCooling ? 'solid' : 'ghost'}
+                  title={sweepCooling ? `RECHARGE ${cooldownLabel(view.sweepReadyAt, now)}` : !sweepItem ? 'NO SWEEP' : 'SWEEP'}
+                  disabled={!sweepItem || sweepCooling || frozen || view.phase !== 'chase'}
+                  onPress={() => sweepItem && send({ t: 'useSweep', itemId: sweepItem.id })} />
+              )}
+              {slashMode && Platform.OS === 'android' && ble === 'on' ? (
+                <Button big icon="sword" style={{ flex: view.powers ? 1.3 : 1 }} color={C.hunter} busy={scanning}
+                  title={frozen ? 'FROZEN' : view.phase !== 'chase' ? 'AFTER HEAD START' : slashCooling ? `SLASH ${cooldownLabel(view.slashReadyAt, now)}` : 'SLASH'}
+                  disabled={view.phase !== 'chase' || frozen || slashCooling} onPress={doSlash}
+                  hint="Get right next to a runner first. Your phone listens for 2.5 s and catches the closest one." />
+              ) : (
+                <Button big icon="handcuffs" style={{ flex: view.powers ? 1.3 : 1 }} title={frozen ? 'FROZEN' : view.phase === 'chase' ? 'CAPTURE' : 'AFTER HEAD START'} color={C.hunter}
+                  disabled={view.phase !== 'chase' || frozen} onPress={() => setCaptureOpen(true)} />
+              )}
+            </View>
+            {slashMode && Platform.OS === 'android' && ble === 'on' && view.phase === 'chase' && !frozen && (
+              <Pressable onPress={() => setCaptureOpen(true)} hitSlop={8} accessibilityRole="button"><Text style={[u.muted, { textAlign: 'center', textDecorationLine: 'underline' }]}>Slash not working? Enter their catch code</Text></Pressable>
+            )}
           </View>
         ) : (
           <View style={{ gap: S.sm }}>
             <Text style={[u.muted, { textAlign: 'center' }]}>
-              {view.lastRevealedAt ? `Last revealed ${ago(now - view.lastRevealedAt)}${view.yourReveal && view.yourReveal.expiresAt > now ? ' · red box = what hunters saw' : ''}` : 'Not revealed yet'}
+              {view.lastRevealedAt ? `Last revealed ${ago(now - view.lastRevealedAt)}${view.yourReveal && view.yourReveal.expiresAt > now ? `${near(view.yourReveal.cell) ? ` ${near(view.yourReveal.cell)}` : ''} · red box = what hunters saw` : ''}` : 'Not revealed yet'}
               {fix ? `  ·  GPS ±${Math.round(fix.acc)} m` : ''}
             </Text>
+            {nearStation && <HoldToCollect stationId={nearStation.id} label="a Freeze" onStart={pushFix} fixes={view.claim?.fixes} />}
+            {stationInRange && !stationGpsOk && <Text style={[u.muted, { textAlign: 'center', color: C.amber }]}>Station here — GPS too weak to collect (needs ±{POWERS.station.maxAccM} m). Step into open sky.</Text>}
+            {view.powers && view.phase === 'chase' && (
+              view.pendingFreeze
+                ? <View style={st.pending}><Text style={[u.body, { color: C.cyan, textAlign: 'center' }]}>❄ Waiting for {view.pendingFreeze.targetAlias} to stop… {Math.max(0, Math.ceil((view.pendingFreeze.expiresAt - now) / 1000))}s</Text></View>
+                : <Button big icon="snowflake" color={C.cyan} title={freezeItem ? 'FREEZE A HUNTER' : 'NO FREEZE · FIND A STATION'} disabled={!freezeItem}
+                    onPress={() => setFreezeOpen(true)} />
+            )}
             <Pressable onPress={() => setShowCode(s => !s)} style={st.codeCard} accessibilityLabel={showCode ? `Catch code ${view.you.catchCode?.split('').join(' ')}` : 'Reveal catch code'}>
               <Text style={u.label}>Catch code · show a hunter only when caught</Text>
               <Text style={st.codeBig}>{showCode ? view.you.catchCode : '• • • •'}</Text>
@@ -291,14 +385,16 @@ export function Game({ view, keepAwake, onToggleAwake }: { view: GameView; keepA
           <View style={st.flashText} pointerEvents="none">
             <Text style={u.label}>You are a</Text>
             <Text style={[st.flashTitle, { color: rc, fontSize: 54 }]}>{role.toUpperCase()}</Text>
-            <Text style={[u.h2, { textAlign: 'center', maxWidth: 280 }]}>{hunter ? 'Stay at START until release.' : 'RUN. Hunters are released soon.'}</Text>
+            <Text style={[u.h2, { textAlign: 'center', maxWidth: 280 }]}>{hunter ? (infection ? 'Stay at START. Everyone you catch joins you for a while.' : 'Stay at START until release.') : 'RUN. Hunters are released soon.'}</Text>
           </View>
         </Animated.View>
       )}
 
       {paused && <PauseOverlay view={view} realNow={realNow} />}
+      {hunter && !paused && view.freezeOffer && view.freezeOffer.expiresAt > realNow && <FreezeOfferOverlay offer={view.freezeOffer} now={realNow} />}
+      {freezeOpen && !caught && !paused && <FreezeSheet view={view} now={now} open onClose={() => setFreezeOpen(false)} />}
       {captureOpen && !caught && !paused && <CaptureSheet view={view} now={now} open onClose={() => setCaptureOpen(false)} />}
-      <RosterSheet view={view} open={rosterOpen} onClose={() => setRosterOpen(false)} />
+      <RosterSheet view={view} open={rosterOpen && !paused} onClose={() => setRosterOpen(false)} />
     </View>
   );
 }
@@ -427,7 +523,7 @@ function CaptureSheet({ view, now, open, onClose }: { view: GameView; now: numbe
 function RosterSheet({ view, open, onClose }: { view: GameView; open: boolean; onClose: () => void }) {
   const insets = useSafeAreaInsets();
   const label = (p: GameView['players'][number]) =>
-    p.status === 'caught' ? ['CAUGHT', C.muted] : p.status === 'withdrawn' ? ['LEFT', C.muted] : !p.connected ? ['OFFLINE', C.warn] : ['ACTIVE', C.ok];
+    p.status === 'caught' ? ['CAUGHT', C.muted] : p.status === 'withdrawn' ? ['LEFT', C.muted] : !p.connected ? ['OFFLINE', C.warn] : p.infected ? ['INFECTED', C.hunter] : ['ACTIVE', C.ok];
   return (
     <Modal visible={open} transparent animationType="slide" onRequestClose={onClose} statusBarTranslucent navigationBarTranslucent>
       <Pressable style={st.scrim} onPress={onClose} accessibilityLabel="Close" />
@@ -467,6 +563,7 @@ const st = StyleSheet.create({
   bannerText: { color: '#fff', fontWeight: '900', fontSize: 14, textAlign: 'center' },
   pauseBtn: { width: undefined, paddingHorizontal: 12, flexDirection: 'row', gap: 4, borderColor: C.amber + '99' },
   pauseTxt: { color: C.amber, fontWeight: '900', fontSize: 12, letterSpacing: 0.8 },
+  pending: { minHeight: 56, borderRadius: 12, borderWidth: 1.5, borderColor: C.cyan, alignItems: 'center', justifyContent: 'center', paddingHorizontal: S.md },
   iconBtn: { width: 42, height: 42, borderRadius: 21, backgroundColor: C.panelSolid, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
   pauseBg: { backgroundColor: C.bg + 'F5', gap: S.md, zIndex: 20 },
   mapBtns: { position: 'absolute', right: S.lg, gap: S.sm },

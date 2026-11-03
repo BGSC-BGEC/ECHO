@@ -10,6 +10,8 @@ import { checkPermission, restartWatching, useLocationUplink } from './src/locat
 import { setupNotifications, useRoundAlerts } from './src/notify';
 import { Home } from './src/screens/Home';
 import { ServerMoved } from './src/components/ServerMoved';
+import { useWorldPack } from './src/world';
+import { useBeacon } from './src/slash';
 import { Lobby } from './src/screens/Lobby';
 import { ZoneEditor } from './src/screens/ZoneEditor';
 import { Game } from './src/screens/Game';
@@ -43,6 +45,8 @@ function Screens() {
   const [editingZone, setEditingZone] = useState(false);
   useLocationUplink();
   useRoundAlerts(view, synced);
+  useBeacon(view?.you.bleId); // slash: this phone is findable by nearby hunters only while the server says so
+  const worldPack = useWorldPack(view?.world);
   // Back button: close the zone editor; never silently exit a live match.
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -58,7 +62,7 @@ function Screens() {
   if (!view) return <Home />;
   if (view.phase === 'lobby') {
     return editingZone && view.you.isHost
-      ? <Awake><ZoneEditor zone={view.zone} onDone={() => setEditingZone(false)} /></Awake>
+      ? <Awake><ZoneEditor zone={view.zone} world={worldPack} onDone={() => setEditingZone(false)} /></Awake>
       : <Awake><Lobby view={view} onEditZone={() => setEditingZone(true)} /></Awake>;
   }
   if (view.phase === 'ended') return <Results view={view} />;

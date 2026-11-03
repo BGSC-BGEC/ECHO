@@ -178,3 +178,15 @@ export function leaveMatch() {
 }
 
 export const clearKicked = () => set({ kicked: undefined });
+
+/** Acknowledge a Freeze even if the socket isn't back yet (phone just woken by the alert). */
+export async function ackFreeze(offerId: string) {
+  if (send({ t: 'ackFreeze', offerId }, true)) return;
+  if (!state.token || !state.serverUrl) return toast('Not connected — reconnecting…');
+  const url = state.serverUrl.replace(/^ws/, 'http').replace(/\/ws\/?$/, '') + '/ack';
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: state.token, offerId }) });
+    const body = await res.json().catch(() => ({}));
+    if (!body?.ok) toast(body?.error ?? 'Couldn’t acknowledge — reconnecting…');
+  } catch { toast('Not connected — reconnecting…'); }
+}

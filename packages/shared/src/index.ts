@@ -35,6 +35,32 @@ export const SHRINK = {
   exposeEveryMs: 20_000,
 } as const;
 
+/** Phase 2 powers (BP §06, TDD §09). Values are pilot parameters. */
+export const POWERS = {
+  inventorySlots: 2,
+  freeze: { offerMs: 8_000, activeMs: 8_000, immunityMs: 45_000, retryMs: 10_000, reachableMs: 15_000 },
+  sweep: { radiusM: 100, brightMs: 8_000, cooldownMs: 60_000 },
+  station: { patchM: 20, holdMs: 3_000, minFixes: 2, respawnMs: 120_000, maxAccM: 20, maxGapMs: 7_000, minSpacingM: 50, edgeMarginM: 25, startClearM: 40 },
+} as const;
+export type ItemType = 'freeze' | 'sweep';
+export const ITEM_FOR: Record<Role, ItemType> = { runner: 'freeze', hunter: 'sweep' };
+
+/** Phase 3.5 modes. Classic: caught runners are out. Infection: caught runners hunt for a while, then turn back. */
+export type GameMode = 'classic' | 'infection';
+export type CatchMethod = 'code' | 'slash';
+export const INFECTION = {
+  durationsMs: [60_000, 120_000, 180_000], // host picks
+  defaultMs: 120_000,
+  cureShieldMs: 30_000, // just-cured runner can't be re-infected straight away (the hunter is standing next to them)
+} as const;
+/** Slash: hunter's phone scans BLE; server picks the strongest in-range runner. Pilot values — tune after the RSSI spike. */
+export const SLASH = {
+  scanMs: 2_500,
+  minRssi: -80, // calibration knob: weaker than this isn't "next to you" (~5 m+ for a pocketed phone)
+  cooldownMs: 5_000, // after every slash, hit or miss: no spamming
+  maxSeen: 32,
+} as const;
+
 export type PresetId = 'test' | 'quick' | 'classic' | 'long';
 
 export interface Preset {
@@ -91,6 +117,18 @@ export type ClientMsg =
   | { t: 'ready'; ready: boolean; alerts?: boolean } // alerts = notifications allowed on this phone
   | { t: 'setContact'; contact: string } // host: event contact / meeting instructions (BP §13)
   | { t: 'setShrink'; on: boolean } // host, lobby: shrinking zone on/off
+  | { t: 'setPowers'; on: boolean } // host, lobby: Freeze / Sweep / stations on/off
+  | { t: 'setRouteSweep'; on: boolean } // host, lobby: Sweep by walking distance on the world's paths (Phase 4)
+  | { t: 'setMode'; mode: GameMode; infectMs?: number } // host, lobby
+  | { t: 'setCatch'; method: CatchMethod } // host, lobby
+  | { t: 'slash'; seen: { id: string; rssi: number }[] } // hunter: BLE ids heard in the last scan
+  | { t: 'setWorld'; worldId: string | null } // host, lobby: which world pack (3D campus) to play on
+  | { t: 'useFreeze'; itemId: string; targetId: string } // runner
+  | { t: 'ackFreeze'; offerId: string } // targeted hunter: "I've stopped"
+  | { t: 'useSweep'; itemId: string } // hunter
+  | { t: 'claimStart'; stationId: string }
+  | { t: 'claimFinish'; stationId: string }
+  | { t: 'claimCancel' }
   | { t: 'start' }
   | { t: 'loc'; lng: number; lat: number; acc: number; ageMs: number; ts?: number } // ageMs = fix age at send; ts = device fix timestamp (dedupe key)
   | { t: 'capture'; code: string } // codes are unique per round; server resolves the runner
@@ -107,7 +145,10 @@ export type GameEvent =
   | { kind: 'pulse'; index: number }
   | { kind: 'revealed' }
   | { kind: 'unavailable' } // your fix was too old/inaccurate at a pulse
-  | { kind: 'captured'; runnerId: string; alias: string; byAlias: string }
+  | { kind: 'captured'; runnerId: string; alias: string; byAlias: string; infected?: boolean }
+  | { kind: 'infected'; byAlias: string; until: number } // you: you're a hunter until `until`
+  | { kind: 'cured' } // you: you're a runner again
+  | { kind: 'slashMiss'; reason: string }
   | { kind: 'phase'; phase: Phase }
   | { kind: 'catchFailed'; attemptsLeft: number; lockedUntil?: number }
   | { kind: 'readyReset'; reason: string }
@@ -116,7 +157,17 @@ export type GameEvent =
   | { kind: 'hostChanged'; alias: string; you: boolean }
   | { kind: 'zoneWarning'; at: number } // next shrink announced
   | { kind: 'zoneShrunk'; stage: number }
-  | { kind: 'exposed' }; // runner: you're outside the shrinking zone and hunters just saw you
+  | { kind: 'exposed' } // runner: you're outside the shrinking zone and hunters just saw you
+  | { kind: 'freezeOffer'; offerId: string; expiresAt: number } // hunter: stop, then acknowledge
+  | { kind: 'freezeResult'; ok: boolean; targetAlias: string; reason?: string } // caster
+  | { kind: 'frozen'; until: number } // hunter
+  | { kind: 'freezeEnded' } // hunter
+  | { kind: 'casterRevealed'; alias: string } // hunters: a freeze revealed its caster's area
+  | { kind: 'sweepResult'; confirmed: number; uncertain: number; unavailable: number; route?: boolean }
+  | { kind: 'scanned' } // runner: a hunter's sweep found you
+  | { kind: 'claimProgress'; stationId: string; fixes: number; need: number } // keep holding
+  | { kind: 'claimed'; stationId: string; item: ItemType } // you got an item
+  | { kind: 'claimFailed'; stationId: string; reason: string };
 
 export type ServerMsg =
   | { t: 'session'; token: string; playerId: string; code: string }
@@ -136,6 +187,7 @@ export interface PlayerSummary {
   hasFix: boolean;
   alerts: boolean; // can receive pocket alerts
   status: 'active' | 'caught' | 'withdrawn';
+  infected?: boolean; // infection mode: a runner currently hunting
 }
 
 export interface Disclosure {
@@ -143,6 +195,7 @@ export interface Disclosure {
   alias: string;
   unavailable: boolean;
   exposed?: boolean; // revealed because they were outside the shrinking zone (a declared game rule)
+  source?: 'pulse' | 'exposed' | 'freeze' | 'sweep'; // why hunters can see this
   cell?: LngLat[]; // closed ring polygon of the coarse area
   sampledAt?: number;
   revealedAt: number;
@@ -158,7 +211,7 @@ export interface Result {
   participants: string[]; // player ids who played this round (late joiners excluded)
   runners: { id: string; alias: string }[]; // who ran this round (kept even if they leave the results screen)
   degraded: boolean; // server restart or host continued past an unreachable player: not a clean competitive result
-  captures: { runnerId: string; alias: string; byAlias: string; atChaseMs: number }[];
+  captures: { runnerId: string; alias: string; byAlias: string; atChaseMs: number; infected?: boolean }[];
   survivors: string[];
 }
 
@@ -168,7 +221,16 @@ export interface View {
   serverNow: number;
   preset: Preset;
   zone: Zone | null;
-  you: { id: string; alias: string; role: Role; isHost: boolean; status: PlayerSummary['status']; catchCode?: string };
+  you: {
+    id: string; alias: string; role: Role; isHost: boolean; status: PlayerSummary['status']; catchCode?: string;
+    infectedUntil?: number; // infection: you hunt until then
+    shieldUntil?: number; // infection: just cured, can't be caught until then
+    bleId?: string; // slash: advertise this over Bluetooth (runner, live round)
+  };
+  mode: GameMode;
+  infectMs: number;
+  catchMethod: CatchMethod;
+  slashReadyAt?: number; // hunter: slash cooldown
   players: PlayerSummary[];
   headStartEndsAt?: number;
   chaseStartedAt?: number;
@@ -186,6 +248,22 @@ export interface View {
   zoneNext?: Circle & { at: number; stage: number }; // announced next circle and when it applies
   graceUntil?: number; // after a shrink: no exposure until this time
   shrinkAt?: number[]; // when upcoming shrinks happen (times only — the circles stay secret until announced)
+  powers: boolean; // Freeze / Sweep / stations enabled for this match
+  routeSweep: boolean; // Sweep counts walking distance along the world's paths, not straight line
+  world?: { id: string; name: string; version: number; hash: string }; // pinned world pack (fetch geometry once via /worlds/:id)
+  worlds?: { id: string; name: string }[]; // lobby: packs the server has (for the host's picker)
+  items?: { id: string; type: ItemType; reserved: boolean }[]; // your own inventory only
+  stations?: { id: string; p: LngLat; available: boolean; availableAt?: number }[]; // public
+  claim?: { stationId: string; startedAt: number; fixes: number }; // your hold in progress
+  // runner: who can be frozen right now (no positions)
+  hunterStates?: { id: string; alias: string; state: 'available' | 'frozen' | 'immune' | 'unreachable' | 'offered' | 'retry'; until?: number }[]; // until: when frozen/immune/retry lapses
+  pendingFreeze?: { targetAlias: string; expiresAt: number }; // runner: your offer awaiting acknowledgement
+  freezeRetryUntil?: number; // runner: after a failed offer
+  // hunter: your freeze state
+  freezeOffer?: { offerId: string; expiresAt: number };
+  frozenUntil?: number;
+  immuneUntil?: number;
+  sweepReadyAt?: number; // hunter: sweep cooldown
   result?: Result;
 }
 
@@ -286,4 +364,47 @@ export function cellRing(p: LngLat, origin: LngLat, sizeM: number): LngLat[] {
   const j = Math.floor(n / sizeM);
   const c = (a: number, b: number) => fromLocal([a * sizeM, b * sizeM], origin);
   return [c(i, j), c(i + 1, j), c(i + 1, j + 1), c(i, j + 1), c(i, j)];
+}
+
+// World packs: the playable place, independent of any match (BP §17.1 "the reusable object is a compiled world").
+// Phase 3: derived from OpenStreetMap and hand-reviewed. Phase 5: from scans. Same contract either way.
+
+export type BuildingKind = 'hostel' | 'academic' | 'dining' | 'sports' | 'admin' | 'religious' | 'other';
+export type WayKind = 'walkway' | 'steps' | 'service' | 'road';
+export type AreaKind = 'lawn' | 'pitch' | 'parking' | 'other';
+
+export interface WorldBuilding { id: string; name?: string; kind: BuildingKind; heightM: number; heightEstimated: boolean; ring: LngLat[] }
+export interface WorldWay { id: string; name?: string; kind: WayKind; line: LngLat[] }
+export interface WorldArea { id: string; name?: string; kind: AreaKind; ring: LngLat[] }
+export interface Landmark { id: string; name: string; p: LngLat; kind: 'building' | 'area' }
+
+export interface WorldPack {
+  schema: 'echo.world/1';
+  id: string;
+  name: string;
+  version: number;
+  hash: string; // sha256 of the canonical content (set by the importer)
+  center: LngLat;
+  bbox: [number, number, number, number]; // w, s, e, n
+  attribution: string;
+  source: { kind: 'osm'; fetchedAt: string; query: string };
+  buildings: WorldBuilding[];
+  ways: WorldWay[];
+  areas: WorldArea[];
+  landmarks: Landmark[];
+}
+
+/** Lightweight description for lists (no geometry). */
+export interface WorldInfo { id: string; name: string; version: number; hash: string; center: LngLat; buildings: number }
+
+/**
+ * Human place name for a point: inside a named building/area → that name; else the nearest landmark within maxM.
+ * Only public map knowledge — callers pass a point no finer than what the player is allowed to know (e.g. a cell centre).
+ */
+export function placeName(p: LngLat, w: Pick<WorldPack, 'buildings' | 'areas' | 'landmarks'>, maxM = 80): string | undefined {
+  for (const b of w.buildings) if (b.name && pointInRing(p, b.ring)) return b.name;
+  for (const a of w.areas) if (a.name && pointInRing(p, a.ring)) return a.name;
+  let best: Landmark | undefined, bestD = maxM;
+  for (const l of w.landmarks) { const d = distanceM(p, l.p); if (d < bestD) { bestD = d; best = l; } }
+  return best?.name;
 }

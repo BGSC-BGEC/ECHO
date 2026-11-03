@@ -11,7 +11,8 @@
     "mobile": "npm start -w mobile",
     "test": "npm test -w server",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w @echo/shared && cd apps/mobile && npx tsc --noEmit",
-    "dev": "npm run dev -w server"
+    "dev": "npm run dev -w server",
+    "world:import": "npm run world:import -w server --"
   },
   "overrides": {
     "react-native-worklets": "0.13.0"

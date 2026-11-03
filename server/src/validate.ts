@@ -1,5 +1,5 @@
 // Trust boundary: every client message is checked here before game logic sees it.
-import { PRESETS, type ClientMsg, type LngLat, type Zone } from '@echo/shared';
+import { PRESETS, SLASH, type ClientMsg, type LngLat, type Zone } from '@echo/shared';
 
 const str = (v: unknown, max: number) => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
 const num = (v: unknown, lo: number, hi: number) => typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi;
@@ -31,6 +31,19 @@ export function parseClientMsg(raw: string): ClientMsg | null {
     case 'kick': return str(m.playerId, 64) ? { t: 'kick', playerId: m.playerId } : null;
     case 'ping': return num(m.c0, 0, Number.MAX_SAFE_INTEGER) ? { t: 'ping', c0: m.c0 } : null;
     case 'start': case 'leave': case 'rematch': case 'endRound': case 'pause': case 'resume': return { t: m.t };
+    case 'setWorld': return m.worldId === null || str(m.worldId, 40) ? { t: 'setWorld', worldId: m.worldId } : null;
+    case 'setPowers': return typeof m.on === 'boolean' ? { t: 'setPowers', on: m.on } : null;
+    case 'setMode': return (m.mode === 'classic' || m.mode === 'infection') && (m.infectMs === undefined || num(m.infectMs, 0, 600_000))
+      ? { t: 'setMode', mode: m.mode, infectMs: m.infectMs } : null;
+    case 'setCatch': return m.method === 'code' || m.method === 'slash' ? { t: 'setCatch', method: m.method } : null;
+    case 'slash': return Array.isArray(m.seen) && m.seen.length <= SLASH.maxSeen && m.seen.every((x: any) => typeof x?.id === 'string' && /^[0-9a-f]{8}$/.test(x.id) && num(x.rssi, -127, 20))
+      ? { t: 'slash', seen: m.seen.map((x: any) => ({ id: x.id, rssi: x.rssi })) } : null;
+    case 'setRouteSweep': return typeof m.on === 'boolean' ? { t: 'setRouteSweep', on: m.on } : null;
+    case 'useFreeze': return str(m.itemId, 32) && str(m.targetId, 64) ? { t: 'useFreeze', itemId: m.itemId, targetId: m.targetId } : null;
+    case 'ackFreeze': return str(m.offerId, 32) ? { t: 'ackFreeze', offerId: m.offerId } : null;
+    case 'useSweep': return str(m.itemId, 32) ? { t: 'useSweep', itemId: m.itemId } : null;
+    case 'claimStart': case 'claimFinish': return str(m.stationId, 16) ? { t: m.t, stationId: m.stationId } : null;
+    case 'claimCancel': return { t: 'claimCancel' };
     case 'setShrink': return typeof m.on === 'boolean' ? { t: 'setShrink', on: m.on } : null;
     case 'setContact': return typeof m.contact === 'string' && m.contact.length <= 120 ? { t: 'setContact', contact: m.contact.trim() } : null;
     default: return null;

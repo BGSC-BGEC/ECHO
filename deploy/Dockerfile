@@ -9,6 +9,8 @@ RUN npm ci --workspace server --include-workspace-root=false --omit=dev --ignore
 COPY packages/shared packages/shared
 COPY server/src server/src
 COPY server/tsconfig.json server/
+COPY worlds worlds
+COPY server/assets server/assets
 ENV NODE_ENV=production PORT=8787 ECHO_DB=/data/echo.db
 RUN mkdir -p /data && chown node:node /data
 VOLUME /data

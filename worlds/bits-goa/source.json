@@ -1,0 +1,11 @@
+{
+  "name": "BITS Pilani, K K Birla Goa Campus",
+  "campusWay": 124552890,
+  "bbox": [
+    73.87,
+    15.385,
+    73.886,
+    15.397
+  ],
+  "note": "campusWay = OSM amenity=college outline of the campus (way 124552890); only features touching it are kept"
+}

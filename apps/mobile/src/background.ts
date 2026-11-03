@@ -32,6 +32,7 @@ let lastPaused = false; // locked phones learn about pauses only through the upl
 let lastPostAt = 0;
 let failingSince = 0; // locked phone that can't reach the server: tell the player once
 let warnedUnreachable = false;
+let lastOfferAlert = ''; // locked hunter: alert once per Freeze offer
 
 /** Foreground fallback: a fix the WebSocket couldn't carry goes over HTTPS instead of being lost. */
 export const uploadViaHttp = (l: Location.LocationObject) => flush([l]);
@@ -68,6 +69,10 @@ async function flush(locations: Location.LocationObject[]) {
         notifyNow('Round resuming', 'Open ECHO to get reveal alerts again.');
       }
       lastPaused = paused;
+      if (body?.freezeOffer?.offerId && body.freezeOffer.offerId !== lastOfferAlert && body.freezeOffer.msLeft > 1500) {
+        lastOfferAlert = body.freezeOffer.offerId;
+        notifyNow('❄ FREEZE INCOMING', `Stop somewhere safe, open ECHO and tap I’VE STOPPED — about ${Math.floor(body.freezeOffer.msLeft / 1000)} s left.`);
+      }
       if (res.status === 401 || body?.stop) { // caught / ended / left: tracking stops
         await cancelAlerts();
         if (body?.phase === 'ended') notifyNow('Round over', 'Open ECHO for the results.');

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { inZone, type LngLat, type Zone } from '@echo/shared';
+import { inZone, type LngLat, type WorldPack, type Zone } from '@echo/shared';
 import { send } from '../net';
 import { useLocation } from '../location';
 import { GameMap } from '../components/GameMap';
@@ -10,13 +10,13 @@ import { C, S } from '../theme';
 
 const RADII = [100, 200, 300, 500, 800];
 
-export function ZoneEditor({ zone, onDone }: { zone: Zone | null; onDone: () => void }) {
+export function ZoneEditor({ zone, onDone, world }: { zone: Zone | null; onDone: () => void; world?: WorldPack }) {
   const insets = useSafeAreaInsets();
   const { fix } = useLocation();
   const [mode, setMode] = useState<'circle' | 'polygon'>(zone?.kind ?? 'circle');
   const [radius, setRadius] = useState(zone?.kind === 'circle' ? zone.radiusM : 200);
   const [picked, setCenter] = useState<LngLat | undefined>(zone?.kind === 'circle' ? zone.center : undefined);
-  const center = picked ?? fix?.p; // GPS may arrive after the editor opens
+  const center = picked ?? fix?.p ?? world?.center; // GPS may arrive after the editor opens
   const [pts, setPts] = useState<LngLat[]>(zone?.kind === 'polygon' ? zone.ring : []);
   const [recenter, setRecenter] = useState(0);
 
@@ -31,7 +31,7 @@ export function ZoneEditor({ zone, onDone }: { zone: Zone | null; onDone: () => 
 
   return (
     <View style={{ flex: 1, backgroundColor: C.bg }}>
-      <GameMap zone={preview} draft={mode === 'polygon' ? pts : undefined} fix={fix} center={center ?? fix?.p} zoom={16} pitch={0}
+      <GameMap zone={preview} draft={mode === 'polygon' ? pts : undefined} fix={fix} center={center ?? fix?.p} zoom={16} pitch={0} world={world}
         mode={recenter ? 'follow' : 'free'} fitKey={recenter} showStart={false}
         padding={{ top: insets.top + 60, bottom: 260, left: 30, right: 30 }}
         onCenter={mode === 'circle' ? setCenter : undefined}

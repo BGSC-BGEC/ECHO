@@ -1,0 +1,6 @@
+{
+  "note": "Hand fixes on top of OpenStreetMap. heights: metres by id (osm:way/123). names: rename/add. exclude: ids to drop.",
+  "heights": {},
+  "names": {},
+  "exclude": []
+}

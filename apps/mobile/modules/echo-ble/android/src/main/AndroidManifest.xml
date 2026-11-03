@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- Android ≤ 11: legacy Bluetooth + location (already granted for GPS) covers scanning -->
+  <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+  <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+  <!-- Android 12+. No neverForLocation: it can strip advertisements from scan results. -->
+  <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+  <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+  <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+</manifest>

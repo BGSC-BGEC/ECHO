@@ -1,12 +1,16 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { StyleSheet } from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
 import { Camera, GeoJSONSource, Layer, Map, type CameraRef } from '@maplibre/maplibre-react-native';
-import { circleRing, fromLocal, startPoint, zoneOrigin, zoneRing, type Circle, type Disclosure, type LngLat, type Zone } from '@echo/shared';
+import { POWERS, circleRing, fromLocal, type WorldPack, startPoint, zoneOrigin, zoneRing, type Circle, type Disclosure, type LngLat, type Zone } from '@echo/shared';
 import type { Fix } from '../location';
+import { useNet } from '../net';
 import { C, MAP_STYLE } from '../theme';
 
-// No internet (LAN-only Wi-Fi / captive portal): plain background, but every game layer still draws.
-const OFFLINE_STYLE = { version: 8 as const, sources: {}, layers: [{ id: 'bg', type: 'background' as const, paint: { 'background-color': '#0E1C2A' } }] };
+// No internet (LAN-only Wi-Fi / captive portal): plain background; label fonts come from the game server.
+const offlineStyle = (httpBase: string) => ({
+  version: 8 as const, sources: {}, ...(httpBase ? { glyphs: `${httpBase}/fonts/{fontstack}/{range}.pbf` } : {}),
+  layers: [{ id: 'bg', type: 'background' as const, paint: { 'background-color': '#0E1C2A' } }],
+});
 
 const WORLD: LngLat[] = [[-180, -85], [180, -85], [180, 85], [-180, 85], [-180, -85]];
 type F = GeoJSON.Feature;
@@ -28,9 +32,11 @@ type Pad = { top: number; bottom: number; left: number; right: number };
 
 export const GameMap = memo(function GameMap({
   zone, disclosures, now = 0, draft, fix, center, zoom = 16, pitch = 50, mode = 'free', fitKey = 0, fitExtra, padding,
-  ownReveal, showStart = true, interactive = true, onPress, onCenter, onUserPan, children, zoneNow, zoneNext,
+  ownReveal, showStart = true, interactive = true, onPress, onCenter, onUserPan, children, zoneNow, zoneNext, stations, sweepRing, world,
 }: {
   zoneNow?: Circle; zoneNext?: Circle;
+  world?: WorldPack; // 3D campus diorama (Phase 3)
+  stations?: { id: string; p: LngLat; available: boolean }[]; sweepRing?: Circle;
   zone?: Zone | null; disclosures?: Disclosure[]; now?: number; draft?: LngLat[]; fix?: Fix; center?: LngLat; zoom?: number; pitch?: number;
   /** follow = keep own GPS centred; zone = fit play zone; free = user controls camera */
   mode?: CameraMode; fitKey?: number; fitExtra?: LngLat[]; padding?: Pad;
@@ -39,6 +45,8 @@ export const GameMap = memo(function GameMap({
 }) {
   const cam = useRef<CameraRef>(null);
   const [offline, setOffline] = useState(false);
+  const { serverUrl } = useNet();
+  const httpBase = serverUrl.replace(/^ws/, 'http').replace(/\/ws\/?$/, '');
   const zoneKey = zone ? JSON.stringify(zone) : '';
   const ring = useMemo(() => (zone ? zoneRing(zone) : undefined), [zoneKey]);
   const pad = padding ?? { top: 60, bottom: 60, left: 40, right: 40 };
@@ -87,6 +95,21 @@ export const GameMap = memo(function GameMap({
   const nextKey = zoneNext ? `${zoneNext.center}|${zoneNext.radiusM}` : '';
   const shrinkMask = useMemo(() => fc(zoneNow ? [poly([WORLD, circleRing(zoneNow)])] : []), [nowKey]);
   const shrinkLine = useMemo(() => fc(zoneNow ? [poly([circleRing(zoneNow)])] : []), [nowKey]);
+  // world pack → GeoJSON (computed once per pack)
+  const worldFc = useMemo(() => world ? {
+    buildings: fc(world.buildings.map(b => poly([b.ring], { h: b.heightM, kind: b.kind, name: b.name ?? '' }))),
+    ways: fc(world.ways.map(w => ({ type: 'Feature', properties: { kind: w.kind }, geometry: { type: 'LineString', coordinates: w.line } }) as F)),
+    areas: fc(world.areas.map(a => poly([a.ring], { kind: a.kind }))),
+    labels: fc(world.landmarks.map(l => point(l.p, { name: l.name, kind: l.kind }))),
+  } : undefined, [world?.hash]);
+
+  const stKey = (stations ?? []).map(x => `${x.id}${x.available ? 1 : 0}`).join(',');
+  const stationFc = useMemo(() => fc((stations ?? []).flatMap(x => [
+    poly([circle(x.p, POWERS.station.patchM)], { open: x.available ? 1 : 0 }), // the real 20 m collection patch
+    point(x.p, { open: x.available ? 1 : 0 }),
+  ])), [stKey]);
+  const sweepKey = sweepRing ? `${sweepRing.center}|${sweepRing.radiusM}` : '';
+  const sweepFc = useMemo(() => fc(sweepRing ? [poly([circleRing(sweepRing)])] : []), [sweepKey]);
   const nextLine = useMemo(() => fc(zoneNext ? [poly([circleRing(zoneNext)])] : []), [nextKey]);
   const border = useMemo(() => fc(ring ? [poly([ring])] : []), [ring]);
   const startPt = useMemo(() => fc(zone && showStart ? [point(startPoint(zone), { label: 'START' })] : []), [zoneKey, showStart]);
@@ -96,7 +119,7 @@ export const GameMap = memo(function GameMap({
   const signals = useMemo(() => fc(live.map(d =>
     poly([d.cell!], { bright: d.brightUntil > now ? 1 : 0, fade: Math.max(0.15, 1 - (now - d.revealedAt) / (d.expiresAt - d.revealedAt)) }))), [live, sec]);
   const labels = useMemo(() => fc(live.map(d => point(centroid(d.cell!), {
-    label: `${d.alias}${d.exposed ? ' · OUTSIDE' : ''}\n${Math.round((now - (d.sampledAt ?? d.revealedAt)) / 1000)}s ago`,
+    label: `${d.alias}${d.source === 'sweep' ? ' · SWEEP' : d.source === 'freeze' ? ' · FROZE' : d.exposed ? ' · OUTSIDE' : ''}\n${Math.round((now - (d.sampledAt ?? d.revealedAt)) / 1000)}s ago`,
   }))), [live, sec]);
   const mine = useMemo(() => fc(ownReveal && ownReveal.expiresAt > now ? [poly([ownReveal.cell])] : []), [ownReveal, sec]);
   const draftFc = useMemo(() => fc(draft?.length ? [
@@ -106,10 +129,12 @@ export const GameMap = memo(function GameMap({
   const me = useMemo(() => fc(fix ? [poly([circle(fix.p, Math.min(fix.acc, 200))], { kind: 'acc' }), point(fix.p, { kind: 'dot' })] : []), [fix?.ts]);
 
   return (
+    <View style={StyleSheet.absoluteFill}>
     <Map
       style={StyleSheet.absoluteFill}
       key={offline ? 'offline' : 'online'}
-      mapStyle={offline ? OFFLINE_STYLE : MAP_STYLE}
+      light={{ anchor: 'viewport', color: '#FFFFFF', intensity: 0.42, position: [1.4, 210, 35] }}
+      mapStyle={offline ? offlineStyle(httpBase) : MAP_STYLE}
       onDidFailLoadingMap={() => setOffline(true)}
       logo={false}
       compass={false}
@@ -123,8 +148,42 @@ export const GameMap = memo(function GameMap({
     >
       <Camera ref={cam} initialViewState={initial} />
 
-      {/* 3D-ish campus: extrude OSM buildings from the style's own vector tiles */}
-      {!offline && <Layer id="echo-buildings" type="fill-extrusion" source="openmaptiles" source-layer="building" minzoom={14}
+      {/* Campus diorama from the world pack (Phase 3): ground first, then paths, then extruded buildings */}
+      {worldFc && (
+        <GeoJSONSource id="w-areas" data={worldFc.areas}>
+          <Layer id="w-areas-fill" type="fill" paint={{
+            'fill-color': ['match', ['get', 'kind'], 'lawn', '#1F4A35', 'pitch', '#25573E', 'parking', '#2B3440', '#22333F'], 'fill-opacity': 0.9,
+          }} />
+          <Layer id="w-areas-line" type="line" paint={{ 'line-color': ['match', ['get', 'kind'], 'pitch', '#5FBF8C', '#2F6B4C'], 'line-width': 1.2 }} />
+        </GeoJSONSource>
+      )}
+      {worldFc && (
+        <GeoJSONSource id="w-ways" data={worldFc.ways}>
+          <Layer id="w-roads" type="line" filter={['==', ['get', 'kind'], 'road']}
+            paint={{ 'line-color': '#5A2E33', 'line-width': ['interpolate', ['linear'], ['zoom'], 15, 3, 19, 14] }} />
+          <Layer id="w-service" type="line" filter={['==', ['get', 'kind'], 'service']}
+            paint={{ 'line-color': '#3C536B', 'line-width': ['interpolate', ['linear'], ['zoom'], 15, 1.5, 19, 8] }} />
+          <Layer id="w-walk" type="line" filter={['==', ['get', 'kind'], 'walkway']}
+            paint={{ 'line-color': '#C9D6DF', 'line-opacity': 0.8, 'line-width': ['interpolate', ['linear'], ['zoom'], 15, 1, 19, 4] }} />
+          <Layer id="w-steps" type="line" filter={['==', ['get', 'kind'], 'steps']}
+            paint={{ 'line-color': '#FFC857', 'line-width': 2.5, 'line-dasharray': [0.6, 0.6] }} />
+        </GeoJSONSource>
+      )}
+      {worldFc && (
+        <GeoJSONSource id="w-buildings" data={worldFc.buildings}>
+          <Layer id="w-buildings-3d" type="fill-extrusion" paint={{
+            'fill-extrusion-color': ['match', ['get', 'kind'],
+              'hostel', '#3A6EA8', 'academic', '#6A5BC2', 'dining', '#B9773A', 'sports', '#2F9A76', 'admin', '#7B8794', 'religious', '#B05A7A', '#3C536B'],
+            'fill-extrusion-height': ['get', 'h'],
+            'fill-extrusion-base': 0,
+            'fill-extrusion-opacity': 0.93,
+            'fill-extrusion-vertical-gradient': true,
+          }} />
+        </GeoJSONSource>
+      )}
+
+      {/* no world pack: fall back to the basemap's own buildings */}
+      {!offline && !worldFc && <Layer id="echo-buildings" type="fill-extrusion" source="openmaptiles" source-layer="building" minzoom={14}
         paint={{
           'fill-extrusion-color': '#1B3550',
           'fill-extrusion-height': ['coalesce', ['get', 'render_height'], 8],
@@ -156,6 +215,23 @@ export const GameMap = memo(function GameMap({
           paint={{ 'text-color': C.amber, 'text-halo-color': C.bg, 'text-halo-width': 2 }} />
       </GeoJSONSource>
 
+      <GeoJSONSource id="stations" data={stationFc}>
+        <Layer id="station-patch" type="fill" filter={['==', ['geometry-type'], 'Polygon']} paint={{
+          'fill-color': ['case', ['==', ['get', 'open'], 1], C.amber, C.muted], 'fill-opacity': 0.14,
+        }} />
+        <Layer id="station-patch-line" type="line" filter={['==', ['geometry-type'], 'Polygon']} paint={{
+          'line-color': ['case', ['==', ['get', 'open'], 1], C.amber, C.muted], 'line-width': 1.5, 'line-opacity': 0.7,
+        }} />
+        <Layer id="station-dot" type="circle" filter={['==', ['geometry-type'], 'Point']} paint={{
+          'circle-radius': 8, 'circle-color': ['case', ['==', ['get', 'open'], 1], C.amber, C.panelHi],
+          'circle-stroke-color': C.bg, 'circle-stroke-width': 3,
+        }} />
+      </GeoJSONSource>
+      <GeoJSONSource id="sweep" data={sweepFc}>
+        <Layer id="sweep-fill" type="fill" paint={{ 'fill-color': C.hunter, 'fill-opacity': 0.08 }} />
+        <Layer id="sweep-line" type="line" paint={{ 'line-color': C.hunter, 'line-width': 2.5, 'line-dasharray': [3, 2] }} />
+      </GeoJSONSource>
+
       <GeoJSONSource id="mine" data={mine}>
         <Layer id="mine-fill" type="fill" paint={{ 'fill-color': C.warn, 'fill-opacity': 0.18 }} />
         <Layer id="mine-line" type="line" paint={{ 'line-color': C.warn, 'line-width': 2, 'line-dasharray': [1, 1] }} />
@@ -182,6 +258,15 @@ export const GameMap = memo(function GameMap({
           layout={{ 'text-field': ['get', 'n'], 'text-font': ['Noto Sans Bold'], 'text-size': 10, 'text-allow-overlap': true }} paint={{ 'text-color': C.cyan }} />
       </GeoJSONSource>
 
+      {worldFc && (
+        <GeoJSONSource id="w-labels" data={worldFc.labels}>
+          <Layer id="w-labels-text" type="symbol" minzoom={15.5} layout={{
+            'text-field': ['get', 'name'], 'text-font': ['Noto Sans Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 15.5, 10, 19, 14],
+            'text-letter-spacing': 0.05, 'text-max-width': 8, 'text-padding': 4,
+          }} paint={{ 'text-color': '#EAF2F4', 'text-halo-color': '#07111B', 'text-halo-width': 1.6, 'text-opacity': 0.92 }} />
+        </GeoJSONSource>
+      )}
+
       {/* own position puck (from the app's single GPS subscription) */}
       <GeoJSONSource id="me" data={me}>
         <Layer id="me-acc" type="fill" filter={['==', ['get', 'kind'], 'acc']} paint={{ 'fill-color': C.cyan, 'fill-opacity': 0.12 }} />
@@ -190,5 +275,13 @@ export const GameMap = memo(function GameMap({
       </GeoJSONSource>
       {children}
     </Map>
+    {(world || offline) && (
+      <Text style={st.credit} pointerEvents="none">{world?.attribution ?? '© OpenStreetMap contributors (ODbL)'}</Text>
+    )}
+    </View>
   );
+});
+
+const st = StyleSheet.create({
+  credit: { position: 'absolute', left: 6, top: '50%', fontSize: 9, color: '#B5C4CDAA', transform: [{ rotate: '-90deg' }, { translateX: -40 }], transformOrigin: 'left' },
 });

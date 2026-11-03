@@ -5,6 +5,9 @@ import type { WebSocket } from 'ws';
 import { PRESETS, RULES, type ClientMsg, type ServerMsg } from '@echo/shared';
 import { Lobby } from './game.ts';
 import { openStore } from './store.ts';
+import { loadWorlds, worldInfo, worlds } from './worlds.ts';
+
+loadWorlds(); // before matches are restored, so restored matches find their world
 import { parseClientMsg } from './validate.ts';
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -25,7 +28,28 @@ const app = Fastify({ logger: { level: 'info' }, disableRequestLogging: true, tr
 app.log.info(`restored ${store.restored} match(es) from disk`);
 await app.register(websocket, { options: { maxPayload: 16 * 1024 } });
 
-app.get('/health', async () => ({ ok: true, matches: lobby.matches.size, presets: Object.keys(PRESETS) }));
+app.get('/health', async () => ({ ok: true, matches: lobby.matches.size, presets: Object.keys(PRESETS), worlds: [...worlds.keys()] }));
+
+// Label glyphs for the no-internet map style (Noto Sans, OFL). Phones on a LAN-only Wi-Fi get them from here.
+const FONTS = fileURLToPath(new URL('../assets/fonts/', import.meta.url));
+app.get('/fonts/:stack/:range', async (req, reply) => {
+  const { stack, range } = req.params as { stack: string; range: string };
+  if (!/^Noto Sans (Bold|Regular)$/.test(stack) || !/^\d+-\d+\.pbf$/.test(range)) return reply.code(404).send();
+  const { readFile } = await import('node:fs/promises');
+  try {
+    const buf = await readFile(`${FONTS}${stack}/${range}`);
+    return reply.header('content-type', 'application/x-protobuf').header('cache-control', 'public, max-age=86400').send(buf);
+  } catch { return reply.code(404).send(); }
+});
+
+// World packs: public map data (no player info). Immutable per hash → clients cache by hash.
+app.get('/worlds', async () => [...worlds.values()].map(worldInfo));
+app.get('/worlds/:id', async (req, reply) => {
+  const w = worlds.get((req.params as { id: string }).id);
+  if (!w) return reply.code(404).send({ ok: false });
+  reply.header('cache-control', 'public, max-age=300').header('etag', `"${w.hash}"`);
+  return w;
+});
 
 // ponytail: in-memory per-IP limiter; fine for one process.
 const ipHits = new Map<string, { n: number; reset: number }>();
@@ -52,13 +76,24 @@ app.post('/loc', async (req, reply) => {
   found.match.touch(found.playerId, now);
   const m = found.match, p = m.players.get(found.playerId)!;
   // A locked phone's only link: tell it about pauses and the end so it can alert the player (and stop tracking).
-  return { ok: true, stop: p.status !== 'active' || m.phase === 'ended', phase: m.phase, status: p.status, paused: m.paused ? { reason: m.paused.reason, by: m.paused.by } : null };
+  return { ok: true, stop: p.status !== 'active' || m.phase === 'ended', phase: m.phase, status: p.status, paused: m.paused ? { reason: m.paused.reason, by: m.paused.by } : null, freezeOffer: m.freezeOfferFor(p.id) ?? null };
 });
 
 let openSockets = 0;
 const MAX_SOCKETS = 2000;
 // IPv6 clients can rotate through a whole /64: rate-limit by prefix.
 const ipKey = (ip: string) => (ip.includes(':') ? ip.split(':').slice(0, 4).join(':') : ip);
+
+// A hunter woken by the "FREEZE incoming" alert may not have a socket yet: acknowledge over HTTPS.
+app.post('/ack', async (req, reply) => {
+  const b = req.body as { token?: unknown; offerId?: unknown };
+  const found = typeof b?.token === 'string' ? lobby.find(b.token) : undefined;
+  if (!found || typeof b.offerId !== 'string' || b.offerId.length > 32) return reply.code(401).send({ ok: false });
+  const now = Date.now();
+  if (!allow(`ack:${found.playerId}`, now, 30)) return reply.code(429).send({ ok: false });
+  const err = found.match.handle(found.playerId, { t: 'ackFreeze', offerId: b.offerId }, now);
+  return { ok: !err, error: err ?? undefined };
+});
 
 app.get('/ws', { websocket: true }, (ws, req) => {
   const ip = ipKey(req.ip);
@@ -138,7 +173,8 @@ const { networkInterfaces } = await import('node:os');
 const virtual = /^(docker|br-|veth|virbr|vmnet|tun|tap|wg|zt|tailscale|cloudflare|utun|lo)/i; // skip VPN/container adapters
 const lan = Object.entries(networkInterfaces()).filter(([name]) => !virtual.test(name))
   .flatMap(([, as]) => as ?? []).filter(a => a.family === 'IPv4' && !a.internal).map(a => a.address);
-console.log('\n  ECHO server is running. Players enter one of these in ECHO → Server:');
+console.log(`\n  ECHO server is running · worlds: ${[...worlds.values()].map(w => `${w.name} v${w.version}`).join(', ') || 'none'}`);
+console.log('  Players enter one of these in ECHO → Server:');
 for (const ip of lan) console.log(`    ${ip}      (= ws://${ip}:${PORT}/ws)`);
 if (!lan.length) console.log('    (no Wi-Fi/Ethernet address found — is this machine on the network?)');
 console.log('');
